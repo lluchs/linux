@@ -1830,6 +1830,18 @@ static int nvme_submit_io(struct nvme_ns *ns, struct nvme_user_io __user *uio)
 	return status;
 }
 
+static int nvme_submit_batch_io(struct nvme_ns *ns, struct nvme_batch_user_io __user *uio) {
+	u64 count, i;
+	int result;
+	if (copy_from_user(&count, &uio->count, sizeof(count)))
+		return -EFAULT;
+	for (i = 0; i < count; i++) {
+		if ((result = nvme_submit_io(ns, &uio->cmds[i])) < 0)
+			return result;
+	}
+	return 0;
+}
+
 static int nvme_user_cmd(struct nvme_dev *dev, struct nvme_ns *ns,
 			struct nvme_passthru_cmd __user *ucmd)
 {
@@ -1919,6 +1931,12 @@ static int nvme_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd,
 		return nvme_sg_get_version_num((void __user *)arg);
 	case SG_IO:
 		return nvme_sg_io(ns, (void __user *)arg);
+	// Custom commands
+	case NVME_IOCTL_SUPPORTS_CUSTOM_CMDS:
+		force_successful_syscall_return();
+		return 1;
+	case NVME_IOCTL_SUBMIT_BATCH_IO:
+		return nvme_submit_batch_io(ns, (void __user *)arg);
 	default:
 		return -ENOTTY;
 	}

@@ -571,6 +571,11 @@ struct nvme_passthru_cmd {
 	__u32	result;
 };
 
+struct nvme_batch_user_io {
+	__u64 count;
+	struct nvme_user_io cmds[];
+};
+
 #define NVME_VS(major, minor) (((major) << 16) | ((minor) << 8))
 
 #define nvme_admin_cmd nvme_passthru_cmd
@@ -579,5 +584,8 @@ struct nvme_passthru_cmd {
 #define NVME_IOCTL_ADMIN_CMD	_IOWR('N', 0x41, struct nvme_admin_cmd)
 #define NVME_IOCTL_SUBMIT_IO	_IOW('N', 0x42, struct nvme_user_io)
 #define NVME_IOCTL_IO_CMD	_IOWR('N', 0x43, struct nvme_passthru_cmd)
+// Custom commands
+#define NVME_IOCTL_SUPPORTS_CUSTOM_CMDS		_IO('N', 0x30)
+#define NVME_IOCTL_SUBMIT_BATCH_IO		_IOW('N', 0x31, struct nvme_batch_user_io)
 
 #endif /* _UAPI_LINUX_NVME_H */
