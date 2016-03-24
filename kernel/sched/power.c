@@ -1,6 +1,8 @@
 #include <linux/percpu.h>
 #include <linux/types.h>
 #include <linux/cpumask.h>
+#include <linux/seq_file.h>
+#include <linux/proc_fs.h>
 
 #include "power.h"
 #include "armpmu_lib.h"
@@ -122,3 +124,33 @@ void power_evaluate_pmu(int cpu)
 	reset_ccnt();
 	enable_pmn();
 }
+
+// Debug output
+
+static int powerstatus_show(struct seq_file *m, void *v)
+{
+	int cpu;
+	for_each_online_cpu(cpu) {
+		seq_printf(m, "CPU %d: %lld pJ\n", cpu, per_cpu(current_energy_usage, cpu));
+	}
+	return 0;
+}
+
+static int powerstatus_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, powerstatus_show, NULL);
+}
+
+static const struct file_operations powerstatus_fops = {
+	.open		= powerstatus_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+static int __init power_init(void)
+{
+	proc_create("power_status", 0, NULL, &powerstatus_fops);
+	return 0;
+}
+module_init(power_init);
