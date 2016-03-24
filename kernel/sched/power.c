@@ -3,12 +3,22 @@
 #include <linux/cpumask.h>
 #include <linux/seq_file.h>
 #include <linux/proc_fs.h>
+#include <linux/jiffies.h>
+#include <linux/math64.h>
 
 #include "power.h"
 #include "armpmu_lib.h"
 
+#define POWER_UPDATE_INTERVAL 1000 // msec
+
+struct current_energy_usage {
+	s64 joule;
+	s64 watt; // updated once per POWER_UPDATE_INTERVAL
+	unsigned long time; // in jiffies
+};
+
 // Last energy usage of each CPU.
-DEFINE_PER_CPU(s64, current_energy_usage);
+DEFINE_PER_CPU(struct current_energy_usage, current_energy_usage);
 
 // Assumption: A7 cores are never disabled.
 #define IS_A7(cpu) (cpu < 4)
@@ -94,7 +104,7 @@ s64 total_current_energy_usage()
 	s64 result = 0;
 	int cpu;
 	for_each_online_cpu(cpu) {
-		result += per_cpu(current_energy_usage, cpu);
+		result += per_cpu(current_energy_usage, cpu).joule;
 	}
 	return result;
 }
@@ -103,7 +113,8 @@ s64 total_current_energy_usage()
 void power_evaluate_pmu(int cpu)
 {
 	u32 cr;
-	s64 usage;
+	struct current_energy_usage *usage = &get_cpu_var(current_energy_usage);
+	unsigned int time_diff;
 	// Check whether the performance counters are enabled.
 	MRC_PMU(cr, PMCR);
 	if (cr & 1) {
@@ -111,13 +122,22 @@ void power_evaluate_pmu(int cpu)
 		cr &= ~1;
 		MCR_PMU(cr, PMCR);
 
-		usage = evaluate_model(cpu);
+		usage->joule += evaluate_model(cpu);
+
+		time_diff = jiffies_to_msecs(jiffies - usage->time);
+		if (time_diff > POWER_UPDATE_INTERVAL) {
+			usage->watt = div64_s64(usage->joule, time_diff);
+			usage->joule = 0;
+			usage->time = jiffies;
+		}
+
 	} else {
 		// CPU was disabled before or this is the first call.
 		initialize_pmu(cpu);
-		usage = 0;
+		usage->joule = 0;
+		usage->watt = 0;
+		usage->time = jiffies;
 	}
-	get_cpu_var(current_energy_usage) = usage;
 	put_cpu_var(current_energy_usage);
 	// Reset and restart the counters.
 	reset_pmn();
@@ -130,8 +150,10 @@ void power_evaluate_pmu(int cpu)
 static int powerstatus_show(struct seq_file *m, void *v)
 {
 	int cpu;
+	struct current_energy_usage *usage;
 	for_each_online_cpu(cpu) {
-		seq_printf(m, "CPU %d: %lld pJ\n", cpu, per_cpu(current_energy_usage, cpu));
+		usage = &per_cpu(current_energy_usage, cpu);
+		seq_printf(m, "CPU %d: %lld nW\n", cpu, usage->watt);
 	}
 	return 0;
 }
