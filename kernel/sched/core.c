@@ -90,6 +90,9 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/sched.h>
 
+// === PM MODIFICATION ===
+#include "power.h"
+
 void start_bandwidth_timer(struct hrtimer *period_timer, ktime_t period)
 {
 	unsigned long delta;
@@ -2989,6 +2992,9 @@ need_resched:
 	rq = cpu_rq(cpu);
 	rcu_note_context_switch(cpu);
 	prev = rq->curr;
+
+	// === PM MODIFICATION ===
+	power_evaluate_pmu(cpu);
 
 	schedule_debug(prev);
 
