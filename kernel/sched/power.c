@@ -5,6 +5,7 @@
 #include <linux/proc_fs.h>
 #include <linux/jiffies.h>
 #include <linux/math64.h>
+#include <stdbool.h>
 
 #include "power.h"
 #include "armpmu_lib.h"
@@ -15,6 +16,7 @@ struct current_energy_usage {
 	s64 joule;
 	s64 watt; // updated once per POWER_UPDATE_INTERVAL
 	unsigned long time; // in jiffies
+	bool disabled;
 };
 
 // Last energy usage of each CPU.
@@ -112,9 +114,22 @@ s64 total_current_energy_usage()
 // Entry point from the scheduler: Evaluates performance counters.
 void power_evaluate_pmu(int cpu)
 {
-	u32 cr;
+	u32 cr, userenr;
 	struct current_energy_usage *usage = &get_cpu_var(current_energy_usage);
 	unsigned int time_diff;
+
+	// Disable power evaluation if user-mode access is enabled.
+	MRC_PMU(userenr, PMUSERENR);
+	if (userenr) {
+		usage->watt = usage->joule = 0;
+		usage->disabled = true;
+		goto out;
+	} else {
+		if (usage->disabled)
+			disable_pmn();
+		usage->disabled = false;
+	}
+
 	// Check whether the performance counters are enabled.
 	MRC_PMU(cr, PMCR);
 	if (cr & 1) {
@@ -138,11 +153,12 @@ void power_evaluate_pmu(int cpu)
 		usage->watt = 0;
 		usage->time = jiffies;
 	}
-	put_cpu_var(current_energy_usage);
 	// Reset and restart the counters.
 	reset_pmn();
 	reset_ccnt();
 	enable_pmn();
+out:
+	put_cpu_var(current_energy_usage);
 }
 
 // Debug output
@@ -153,7 +169,10 @@ static int powerstatus_show(struct seq_file *m, void *v)
 	struct current_energy_usage *usage;
 	for_each_online_cpu(cpu) {
 		usage = &per_cpu(current_energy_usage, cpu);
-		seq_printf(m, "CPU %d: %lld nW\n", cpu, usage->watt);
+		if (usage->disabled)
+			seq_printf(m, "CPU %d: monitoring disabled (USERENR = 1)\n", cpu);
+		else
+			seq_printf(m, "CPU %d: %lld nW\n", cpu, usage->watt);
 	}
 	return 0;
 }
