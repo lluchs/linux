@@ -1,8 +1,8 @@
 #include <linux/percpu.h>
 #include <linux/types.h>
+#include <linux/cpu.h>
 #include <linux/cpumask.h>
 #include <linux/seq_file.h>
-#include <linux/proc_fs.h>
 #include <linux/jiffies.h>
 #include <linux/math64.h>
 #include <stdbool.h>
@@ -21,8 +21,10 @@ struct current_energy_usage {
 
 // Last energy usage of each CPU.
 DEFINE_PER_CPU(struct current_energy_usage, current_energy_usage);
+// Maximum energy usage per CPU in nW.
+DEFINE_PER_CPU(s64, power_limit);
 
-// Assumption: A7 cores are never disabled.
+// A7 cores always come first. Disabling CPUs doesn't change the indices.
 #define IS_A7(cpu) (cpu < 4)
 
 struct energy_model {
@@ -161,37 +163,77 @@ out:
 	put_cpu_var(current_energy_usage);
 }
 
-// Debug output
-
-static int powerstatus_show(struct seq_file *m, void *v)
+// Throttling function: returns true if the calling CPU may use more energy.
+bool power_cpu_has_energy_left(void)
 {
-	int cpu;
+	int cpu = smp_processor_id();
 	struct current_energy_usage *usage;
-	for_each_online_cpu(cpu) {
-		usage = &per_cpu(current_energy_usage, cpu);
-		if (usage->disabled)
-			seq_printf(m, "CPU %d: monitoring disabled (USERENR = 1)\n", cpu);
-		else
-			seq_printf(m, "CPU %d: %lld nW\n", cpu, usage->watt);
-	}
-	return 0;
+	s64 maximum_energy_usage = per_cpu(power_limit, cpu);
+	bool result;
+
+	// We're never throttling A7 cores.
+	// TODO: Maybe only always execute the first CPU core?
+	if (IS_A7(cpu) || maximum_energy_usage <= 0) return true;
+
+	usage = &get_cpu_var(current_energy_usage);
+	result = maximum_energy_usage < div64_s64(usage->joule, jiffies_to_msecs(jiffies - usage->time));
+	put_cpu_var(current_energy_usage);
+	return result;
 }
 
-static int powerstatus_open(struct inode *inode, struct file *file)
+// File nodes in sysfs
+
+static ssize_t show_power_status(struct device *dev,
+			   struct device_attribute *attr,
+			   char *buf)
 {
-	return single_open(file, powerstatus_show, NULL);
+	struct cpu *cpu = container_of(dev, struct cpu, dev);
+	struct current_energy_usage *usage = &per_cpu(current_energy_usage, cpu->dev.id);
+
+	if (usage->disabled)
+		return sprintf(buf, "monitoring disabled (USERENR = 1)\n");
+	else
+		return sprintf(buf, "%lld nW\n", usage->watt);
 }
 
-static const struct file_operations powerstatus_fops = {
-	.open		= powerstatus_open,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
+static DEVICE_ATTR(power_status, 0444, show_power_status, NULL);
+
+static ssize_t show_power_limit(struct device *dev,
+			   struct device_attribute *attr,
+			   char *buf)
+{
+	struct cpu *cpu = container_of(dev, struct cpu, dev);
+
+	return sprintf(buf, "%lld\n", per_cpu(power_limit, cpu->dev.id));
+}
+
+static ssize_t __ref store_power_limit(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	ssize_t ret;
+	s64 limit;
+
+	ret = kstrtos64(buf, 0, &limit);
+	if (ret >= 0) {
+		per_cpu(power_limit, dev->id) = limit;
+		ret = count;
+	}
+	return ret;
+}
+
+static DEVICE_ATTR(power_limit, 0644, show_power_limit, store_power_limit);
 
 static int __init power_init(void)
 {
-	proc_create("power_status", 0, NULL, &powerstatus_fops);
+	int i;
+
+	for_each_possible_cpu(i) {
+		device_create_file(get_cpu_device(i), &dev_attr_power_status);
+		device_create_file(get_cpu_device(i), &dev_attr_power_limit);
+		per_cpu(power_limit, i) = 0;
+	}
+
 	return 0;
 }
 module_init(power_init);
