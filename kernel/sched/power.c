@@ -1,7 +1,10 @@
 #include <linux/percpu.h>
+#include <linux/topology.h>
 #include <linux/types.h>
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
+#include <linux/delay.h>
+#include <linux/kthread.h>
 #include <linux/seq_file.h>
 #include <linux/jiffies.h>
 #include <linux/math64.h>
@@ -113,6 +116,78 @@ s64 total_current_energy_usage()
 	return result;
 }
 
+// from drivers/base/cpu.c
+static void change_cpu_under_node(struct cpu *cpu,
+            unsigned int from_nid, unsigned int to_nid)
+{
+	int cpuid = cpu->dev.id;
+	unregister_cpu_under_node(cpuid, from_nid);
+	register_cpu_under_node(cpuid, to_nid);
+	cpu->node_id = to_nid;
+}
+
+// Enables or disables a CPU. Returns 0 on success.
+static int power_set_cpu_online(int cpuid, bool online)
+{
+	// from drivers/base/cpu.c
+	struct device *dev = get_cpu_device(cpuid);
+	struct cpu *cpu = container_of(dev, struct cpu, dev);
+	int from_nid, to_nid;
+	int ret;
+	cpu_hotplug_driver_lock();
+	if (!online) {
+		ret = cpu_down(cpuid);
+		if (!ret)
+			kobject_uevent(&dev->kobj, KOBJ_OFFLINE);
+	} else {
+		from_nid = cpu_to_node(cpuid);
+		ret = cpu_up(cpuid);
+
+		/*
+		 * When hot adding memory to memoryless node and enabling a cpu
+		 * on the node, node number of the cpu may internally change.
+		 */
+		to_nid = cpu_to_node(cpuid);
+		if (from_nid != to_nid)
+			change_cpu_under_node(cpu, from_nid, to_nid);
+
+		if (!ret)
+			kobject_uevent(&dev->kobj, KOBJ_ONLINE);
+	}
+	cpu_hotplug_driver_unlock();
+	return ret;
+}
+
+static struct task_struct *thread;
+// Kernel thread for limiting.
+static int powerlimitd(void *p)
+{
+	int cpu;
+	struct current_energy_usage *usage;
+	s64 limit;
+	unsigned int time_diff;
+	while (1) {
+		for_each_possible_cpu(cpu) {
+			if (IS_A7(cpu)) continue;
+			limit = per_cpu(power_limit, cpu);
+			if (limit == 0) continue;
+			usage = &per_cpu(current_energy_usage, cpu);
+			if (cpu_online(cpu)) {
+				if (limit < div64_s64(usage->joule, POWER_UPDATE_INTERVAL))
+					power_set_cpu_online(cpu, false);
+			} else {
+				time_diff = jiffies_to_msecs(jiffies - usage->time);
+				// TODO: The power_status nodes will report 0 after a CPU is re-enabled.
+				if (time_diff > POWER_UPDATE_INTERVAL)
+					power_set_cpu_online(cpu, true);
+			}
+		}
+
+		msleep(100);
+	}
+	return 0;
+}
+
 // Entry point from the scheduler: Evaluates performance counters.
 void power_evaluate_pmu(int cpu)
 {
@@ -161,24 +236,6 @@ void power_evaluate_pmu(int cpu)
 	enable_pmn();
 out:
 	put_cpu_var(current_energy_usage);
-}
-
-// Throttling function: returns true if the calling CPU may use more energy.
-bool power_cpu_has_energy_left(void)
-{
-	int cpu = smp_processor_id();
-	struct current_energy_usage *usage;
-	s64 maximum_energy_usage = per_cpu(power_limit, cpu);
-	bool result;
-
-	// We're never throttling A7 cores.
-	// TODO: Maybe only always execute the first CPU core?
-	if (IS_A7(cpu) || maximum_energy_usage <= 0) return true;
-
-	usage = &get_cpu_var(current_energy_usage);
-	result = maximum_energy_usage < div64_s64(usage->joule, jiffies_to_msecs(jiffies - usage->time));
-	put_cpu_var(current_energy_usage);
-	return result;
 }
 
 // File nodes in sysfs
@@ -233,6 +290,12 @@ static int __init power_init(void)
 		device_create_file(get_cpu_device(i), &dev_attr_power_limit);
 		per_cpu(power_limit, i) = 0;
 	}
+
+	thread = kthread_run(powerlimitd, NULL, "powerlimitd");
+	if (IS_ERR(thread)) {
+		printk(KERN_ERR "power: unable to create limiting thread\n");
+	}
+	printk(KERN_NOTICE "power: finished initialization\n");
 
 	return 0;
 }
