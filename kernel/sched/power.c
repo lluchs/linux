@@ -167,8 +167,7 @@ static int powerlimitd(void *p)
 	struct cpufreq_policy *policy = p;
 	int cpu;
 	struct current_energy_usage *usage;
-	s64 limit, total_usage;
-	unsigned int time_diff;
+	s64 limit, total_usage, diff, freq;
 	while (!kthread_should_stop()) {
 		limit = 0; total_usage = 0;
 		// Frequency governors work on groups of CPUs. In our case, we
@@ -180,12 +179,16 @@ static int powerlimitd(void *p)
 		}
 
 		if (limit > 0) {
-			if (limit < div64_s64(total_usage, POWER_UPDATE_INTERVAL)) {
-				cpufreq_driver_target(policy, policy->min, CPUFREQ_RELATION_L);
-			} else {
-				cpufreq_driver_target(policy, policy->max, CPUFREQ_RELATION_L);
-			}
+			// Convert nJ to µW.
+			total_usage = div64_s64(total_usage, POWER_UPDATE_INTERVAL);
+			// Controller for setting the frequency.
+			diff = limit - total_usage;
+			freq = policy->min + div64_s64((policy->max - policy->min) * diff, limit);
+			// Fix bounds. Note that frequencies are unsigned int.
+			freq = min((s64) policy->max, max((s64) policy->min, freq));
+			cpufreq_driver_target(policy, (unsigned int) freq, CPUFREQ_RELATION_L);
 		} else {
+			// No configured limit, run at maximum frequency.
 			cpufreq_driver_target(policy, policy->max, CPUFREQ_RELATION_L);
 		}
 
