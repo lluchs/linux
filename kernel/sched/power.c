@@ -2,6 +2,7 @@
 #include <linux/topology.h>
 #include <linux/types.h>
 #include <linux/cpu.h>
+#include <linux/cpufreq.h>
 #include <linux/cpumask.h>
 #include <linux/delay.h>
 #include <linux/kthread.h>
@@ -159,34 +160,78 @@ static int power_set_cpu_online(int cpuid, bool online)
 }
 
 static struct task_struct *thread;
+
 // Kernel thread for limiting.
 static int powerlimitd(void *p)
 {
+	struct cpufreq_policy *policy = p;
 	int cpu;
 	struct current_energy_usage *usage;
-	s64 limit;
+	s64 limit, total_usage;
 	unsigned int time_diff;
-	while (1) {
-		for_each_possible_cpu(cpu) {
-			if (IS_A7(cpu)) continue;
-			limit = per_cpu(power_limit, cpu);
-			if (limit == 0) continue;
+	while (!kthread_should_stop()) {
+		limit = 0; total_usage = 0;
+		// Frequency governors work on groups of CPUs. In our case, we
+		// have all A7 cores and all A15 cores.
+		for_each_cpu(cpu, policy->related_cpus) {
+			limit += per_cpu(power_limit, cpu);
 			usage = &per_cpu(current_energy_usage, cpu);
-			if (cpu_online(cpu)) {
-				if (limit < div64_s64(usage->joule, POWER_UPDATE_INTERVAL))
-					power_set_cpu_online(cpu, false);
+			total_usage += usage->joule;
+		}
+
+		if (limit > 0) {
+			if (limit < div64_s64(total_usage, POWER_UPDATE_INTERVAL)) {
+				cpufreq_driver_target(policy, policy->min, CPUFREQ_RELATION_L);
 			} else {
-				time_diff = jiffies_to_msecs(jiffies - usage->time);
-				// TODO: The power_status nodes will report 0 after a CPU is re-enabled.
-				if (time_diff > POWER_UPDATE_INTERVAL)
-					power_set_cpu_online(cpu, true);
+				cpufreq_driver_target(policy, policy->max, CPUFREQ_RELATION_L);
 			}
+		} else {
+			cpufreq_driver_target(policy, policy->max, CPUFREQ_RELATION_L);
 		}
 
 		msleep(100);
 	}
 	return 0;
 }
+
+static int cpufreq_governor_pmu(struct cpufreq_policy *policy, unsigned int event)
+{
+        switch (event) {
+        case CPUFREQ_GOV_START:
+		thread = kthread_run(powerlimitd, policy, "powerlimitd");
+		if (IS_ERR(thread)) {
+			printk(KERN_ERR "power: unable to create limiting thread\n");
+		}
+		// Run at maximum frequency per default.
+                __cpufreq_driver_target(policy, policy->max, CPUFREQ_RELATION_L);
+                break;
+	case CPUFREQ_GOV_STOP:
+		kthread_stop(thread);
+		break;
+        default:
+                break;
+        }
+        return 0;
+}
+
+struct cpufreq_governor cpufreq_gov_pmu = {
+        .name = "pmugov",
+        .governor = cpufreq_governor_pmu,
+        .owner = THIS_MODULE,
+};
+
+static int __init cpufreq_gov_pmu_init(void)
+{
+        return cpufreq_register_governor(&cpufreq_gov_pmu);
+}
+
+static void __exit cpufreq_gov_pmu_exit(void)
+{
+        cpufreq_unregister_governor(&cpufreq_gov_pmu);
+}
+
+module_init(cpufreq_gov_pmu_init);
+module_exit(cpufreq_gov_pmu_exit);
 
 // Entry point from the scheduler: Evaluates performance counters.
 void power_evaluate_pmu(int cpu)
@@ -291,10 +336,6 @@ static int __init power_init(void)
 		per_cpu(power_limit, i) = 0;
 	}
 
-	thread = kthread_run(powerlimitd, NULL, "powerlimitd");
-	if (IS_ERR(thread)) {
-		printk(KERN_ERR "power: unable to create limiting thread\n");
-	}
 	printk(KERN_NOTICE "power: finished initialization\n");
 
 	return 0;
