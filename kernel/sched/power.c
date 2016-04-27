@@ -14,7 +14,7 @@
 #include "power.h"
 #include "armpmu_lib.h"
 
-#define POWER_UPDATE_INTERVAL 1000 // msec
+#define POWER_UPDATE_INTERVAL 500 // msec
 
 struct current_energy_usage {
 	s64 joule;
@@ -167,23 +167,33 @@ static int powerlimitd(void *p)
 	struct cpufreq_policy *policy = p;
 	int cpu;
 	struct current_energy_usage *usage;
-	s64 limit, total_usage, diff, freq;
+	s64 limit, total_usage, last_total_usage, freq;
+	unsigned int time_diff;
 	while (!kthread_should_stop()) {
-		limit = 0; total_usage = 0;
+		limit = 0; total_usage = 0; last_total_usage = 0;
 		// Frequency governors work on groups of CPUs. In our case, we
 		// have all A7 cores and all A15 cores.
 		for_each_cpu(cpu, policy->related_cpus) {
 			limit += per_cpu(power_limit, cpu);
 			usage = &per_cpu(current_energy_usage, cpu);
-			total_usage += usage->joule;
+			time_diff = jiffies_to_msecs(jiffies - usage->time);
+			// Convert pJ to nW. Protect against the unlikely division by zero, just in
+			// case.
+			total_usage += div64_s64(usage->joule, time_diff > 0 ? time_diff : 1);
+			last_total_usage += usage->watt;
 		}
 
 		if (limit > 0) {
-			// Convert nJ to µW.
-			total_usage = div64_s64(total_usage, POWER_UPDATE_INTERVAL);
-			// Controller for setting the frequency.
-			diff = limit - total_usage;
-			freq = policy->min + div64_s64((policy->max - policy->min) * diff, limit);
+			// Calculate the frequency depending on the available energy.
+			freq = policy->min;
+			// This loop runs with a higher frequency than the output. We use both the
+			// current value and the value from the last POWER_UPDATE_INTERVAL to smooth
+			// frequency setting.
+			freq += div64_s64(
+					(policy->max - policy->min)
+					* (3 * (limit - total_usage) +
+					   1 * (limit - last_total_usage)),
+					/* ÷ */ limit * 4);
 			// Fix bounds. Note that frequencies are unsigned int.
 			freq = min((s64) policy->max, max((s64) policy->min, freq));
 			cpufreq_driver_target(policy, (unsigned int) freq, CPUFREQ_RELATION_L);
